@@ -1,11 +1,11 @@
 [package]
-name = "enrichment-cache"
+name = "clearly-cached"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.90"
 license = "AGPL-3.0-or-later"
-description = "Caching, normalising front end for package metadata sources used by sbomify-action"
-repository = "https://github.com/sbomify/enrichment-cache"
+description = "Caching, normalising front end for the ClearlyDefined definitions API"
+repository = "https://github.com/sbomify/clearly-cached"
 
 [dependencies]
 # Deliberately few. Everything here earns its place:

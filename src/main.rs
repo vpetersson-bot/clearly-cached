@@ -1,4 +1,4 @@
-//! A caching, normalising front end for package metadata sources.
+//! A caching, normalising front end for the ClearlyDefined definitions API.
 //!
 //! Sits between sbomify-action and api.clearlydefined.io and does three things
 //! the client cannot do for itself:
@@ -11,9 +11,11 @@
 //!   * **shrinks the answer** — a definition is up to ~190KB of per-file
 //!     analysis and consumers read four fields of it.
 //!
-//! It is deliberately not a general proxy. Only ClearlyDefined is served,
-//! because its curated data is CC0-1.0; the other sources sbomify-action reads
-//! carry terms that do not obviously permit re-serving them.
+//! One upstream, on purpose. ClearlyDefined's curated data is CC0-1.0, which is
+//! what makes caching and re-serving it unambiguous; the other sources
+//! sbomify-action reads carry terms that do not obviously permit the same, and
+//! a service that reflected arbitrary paths upstream would be a general proxy
+//! for whoever found it. Neither is a gap to be filled later.
 //!
 //! Designed to sit behind a CDN. The Cache-Control it emits is the useful knob:
 //! the edge does the geographic work, this process does the normalising and the
@@ -94,9 +96,9 @@ async fn main() {
         // the request timeout distinguishes "unreachable" from "thinking".
         .connect_timeout(Duration::from_secs(5))
         .user_agent(concat!(
-            "sbomify-enrichment-cache/",
+            "clearly-cached/",
             env!("CARGO_PKG_VERSION"),
-            " (+https://github.com/sbomify/enrichment-cache)"
+            " (+https://github.com/sbomify/clearly-cached)"
         ))
         .build()
         .expect("failed to build HTTP client");
@@ -109,8 +111,11 @@ async fn main() {
     });
 
     let app = Router::new()
+        // Mirrors upstream's own path shape, minus the leading /definitions
+        // being qualified by anything: there is only one upstream, so a
+        // /clearlydefined/ segment would say nothing the service name does not.
         .route(
-            "/v1/clearlydefined/{kind}/{provider}/{namespace}/{name}/{revision}",
+            "/v1/definitions/{kind}/{provider}/{namespace}/{name}/{revision}",
             get(definition),
         )
         .route("/healthz", get(|| async { "ok" }))
@@ -120,7 +125,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
-    eprintln!("enrichment-cache listening on {addr}, upstream {upstream}");
+    eprintln!("clearly-cached listening on {addr}, upstream {upstream}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

@@ -1,9 +1,8 @@
-# enrichment-cache
+# clearly-cached
 
-A caching, normalising front end for the package metadata sources
-[sbomify-action](https://github.com/sbomify/sbomify-action) reads.
-
-Currently serves [ClearlyDefined](https://clearlydefined.io) only.
+A caching, normalising front end for the
+[ClearlyDefined](https://clearlydefined.io) definitions API, built for
+[sbomify-action](https://github.com/sbomify/sbomify-action).
 
 ## Why
 
@@ -34,13 +33,14 @@ and parse time in every client.
 ## API
 
 ```
-GET /v1/clearlydefined/{type}/{provider}/{namespace}/{name}/{revision}
+GET /v1/definitions/{type}/{provider}/{namespace}/{name}/{revision}
 ```
 
-Use `-` for an absent namespace, matching ClearlyDefined's own coordinates.
+The path mirrors ClearlyDefined's own coordinates, including `-` for an absent
+namespace. The response does not: it is the projection, not the definition.
 
 ```console
-$ curl https://…/v1/clearlydefined/pypi/pypi/-/requests/2.32.3
+$ curl https://…/v1/definitions/pypi/pypi/-/requests/2.32.3
 {
   "declared": "Apache-2.0",
   "parties": ["Copyright Kenneth Reitz"],
@@ -77,6 +77,10 @@ the coordinate is immutable and only a curation changes it. An unharvested one
 is held for 6 hours, so a package harvested tomorrow is not remembered as empty
 for a month. The `Cache-Control` sent to any CDN in front follows the same split.
 
+**Forwards only known coordinates.** Type/provider pairs are an allow-list.
+Without one, any path under `/v1/` is reflected into an upstream URL and this
+becomes a general-purpose proxy for whoever finds it.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -90,8 +94,8 @@ for a month. The `Cache-Control` sent to any CDN in front follows the same split
 ## Running
 
 ```console
-$ docker build -t enrichment-cache .
-$ docker run -p 8080:8080 enrichment-cache
+$ docker build -t clearly-cached .
+$ docker run -p 8080:8080 clearly-cached
 ```
 
 The image is a static musl binary on `scratch` — about 5.5MB, no shell, no
@@ -101,20 +105,20 @@ no system certificate store to mount.
 It is designed to sit behind a CDN. The edge does the geographic work; this
 process does the normalising and the collapsing.
 
-## Why only ClearlyDefined
+## Scope
 
-Because re-serving someone else's data is a licensing question, and
-ClearlyDefined is the one source where the answer is unambiguous: its curated
-data is [CC0-1.0](https://github.com/clearlydefined/curated-data/blob/master/LICENSE),
+One upstream, deliberately. Re-serving someone else's data is a licensing
+question, and ClearlyDefined is the source where the answer is unambiguous: its
+curated data is [CC0-1.0](https://github.com/clearlydefined/curated-data/blob/master/LICENSE),
 a public domain dedication that explicitly covers database rights and permits
 redistribution for any purpose.
 
-That does not generalise. `ecosyste.ms` publishes its data under CC BY-SA 4.0,
-which carries attribution and share-alike obligations and sits alongside a
-commercial licensing offer. Repology asks bulk consumers to use its database
-dumps rather than the API. `deps.dev` publishes no data licence at all. None of
-those should be added here without deciding, deliberately, that the terms allow
-it.
+That does not generalise, which is why nothing else is served here.
+`ecosyste.ms` publishes its data under CC BY-SA 4.0, carrying attribution and
+share-alike obligations alongside a commercial licensing offer. Repology asks
+bulk consumers to use its database dumps rather than the API. `deps.dev`
+publishes no data licence at all. Those sources need their own answers, and
+probably their own services — not a second backend behind this one.
 
 ## Licence
 

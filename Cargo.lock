@@ -132,6 +132,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clearly-cached"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "compression-codecs"
 version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,17 +186,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "enrichment-cache"
-version = "0.1.0"
-dependencies = [
- "axum",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

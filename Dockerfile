@@ -24,10 +24,10 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM scratch
-COPY --from=builder /build/target/release/enrichment-cache /enrichment-cache
+COPY --from=builder /build/target/release/clearly-cached /clearly-cached
 
 # Non-root by uid: scratch has no /etc/passwd to name a user in.
 USER 65532:65532
 
 EXPOSE 8080
-ENTRYPOINT ["/enrichment-cache"]
+ENTRYPOINT ["/clearly-cached"]
