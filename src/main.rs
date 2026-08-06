@@ -36,7 +36,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 use cache::Cache;
 use clearlydefined::{Client, Coordinate, Definition, FetchError};
@@ -87,8 +87,21 @@ impl Source {
     }
 }
 
+/// A resolve that produced no definition, and the status it deserves.
+///
+/// Carried rather than flattened to one code: a coordinate upstream rejects is
+/// not the same event as an upstream that stalled, and answering both with 504
+/// tells a client with retry-on-5xx to keep asking for something that will
+/// never exist. Nothing here is cached, so the retry is a fresh upstream fetch
+/// every time.
+#[derive(Debug, Clone)]
+struct Failure {
+    status: StatusCode,
+    message: String,
+}
+
 /// Result shared between everyone waiting on one in-flight resolve.
-type Shared = Result<(Definition, Source), String>;
+type Shared = Result<(Definition, Duration, Source), Failure>;
 
 struct AppState {
     cache: Cache<Definition>,
@@ -105,7 +118,11 @@ struct AppState {
     /// upstream fetches instead of 1, precisely because the upstream was slow
     /// enough for callers to time out. Spawning means the work completes and
     /// populates the cache even if every caller has walked away.
-    inflight: Mutex<HashMap<String, broadcast::Sender<Arc<Shared>>>>,
+    ///
+    /// A std lock rather than tokio's: every critical section is a map lookup
+    /// with no await in it, and `InflightGuard` has to be able to clear an
+    /// entry from `Drop`, which cannot await.
+    inflight: std::sync::Mutex<HashMap<String, broadcast::Sender<Arc<Shared>>>>,
     /// The disk tier: everything ever fetched and not yet expired.
     ///
     /// The map above evicts under pressure, this does not. A definition pushed
@@ -152,7 +169,7 @@ async fn main() {
     // instead of an upstream fetch.
     let store = match cache_path() {
         None => None,
-        Some(path) => match Store::open(&path) {
+        Some(path) => match Store::open(&path, env_u64("CACHE_DISK_MAX_ENTRIES", 2_000_000)) {
             Ok(store) => {
                 eprintln!(
                     "cache: {} entries on disk at {}",
@@ -177,21 +194,11 @@ async fn main() {
         cache: Cache::new(capacity),
         client: Client::new(http, upstream.clone(), attempts),
         stats: Stats::default(),
-        inflight: Mutex::new(HashMap::new()),
+        inflight: std::sync::Mutex::new(HashMap::new()),
         store,
     });
 
-    let app = Router::new()
-        // Mirrors upstream's own path shape, minus the leading /definitions
-        // being qualified by anything: there is only one upstream, so a
-        // /clearlydefined/ segment would say nothing the service name does not.
-        .route(
-            "/v1/definitions/{kind}/{provider}/{namespace}/{name}/{revision}",
-            get(definition),
-        )
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/stats", get(stats))
-        .with_state(state.clone());
+    let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -201,8 +208,12 @@ async fn main() {
     if state.store.is_some() {
         let state = state.clone();
         tokio::spawn(async move {
+            // interval's first tick fires immediately, and that one is kept on
+            // purpose: sweeping is the only thing that reclaims expired rows,
+            // so a service that redeploys or crash-loops more often than
+            // SWEEP_EVERY would otherwise never reach a sweep at all and grow
+            // without bound on a persistent volume.
             let mut tick = tokio::time::interval(SWEEP_EVERY);
-            tick.tick().await; // interval fires immediately; skip that one.
             loop {
                 tick.tick().await;
                 if let Some(store) = &state.store {
@@ -258,6 +269,20 @@ async fn shutdown_signal() {
     eprintln!("clearly-cached shutting down");
 }
 
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        // Mirrors upstream's own path shape, minus the leading /definitions
+        // being qualified by anything: there is only one upstream, so a
+        // /clearlydefined/ segment would say nothing the service name does not.
+        .route(
+            "/v1/definitions/{kind}/{provider}/{namespace}/{name}/{revision}",
+            get(definition),
+        )
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/stats", get(stats))
+        .with_state(state)
+}
+
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "entries": state.cache.len(),
@@ -285,22 +310,24 @@ async fn definition(
     };
     let key = coord.cache_key();
 
-    if let Some(def) = state.cache.get(&key) {
+    if let Some((def, remaining)) = state.cache.get(&key) {
         state.stats.hits.fetch_add(1, Ordering::Relaxed);
-        return serve(def, Source::Memory);
+        return serve(def, remaining, Source::Memory);
     }
 
     // Collapse everything past this point -- the disk read as well as the fetch.
     // Thirty simultaneous requests for one evicted coordinate should be one
     // disk read, for the same reason they should be one upstream fetch.
     let mut receiver = {
-        let mut inflight = state.inflight.lock().await;
+        let Ok(mut inflight) = state.inflight.lock() else {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "inflight lock poisoned");
+        };
 
         // Re-check under the map lock: the resolve may have finished between
         // the cache miss above and getting here.
-        if let Some(def) = state.cache.get(&key) {
+        if let Some((def, remaining)) = state.cache.get(&key) {
             state.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return serve(def, Source::Memory);
+            return serve(def, remaining, Source::Memory);
         }
 
         match inflight.get(&key) {
@@ -316,12 +343,41 @@ async fn definition(
 
     match receiver.recv().await {
         Ok(shared) => match &*shared {
-            Ok((def, source)) => serve(def.clone(), *source),
-            Err(message) => error(StatusCode::GATEWAY_TIMEOUT, message),
+            Ok((def, ttl, source)) => serve(def.clone(), *ttl, *source),
+            Err(failure) => error(failure.status, &failure.message),
         },
-        // The sender was dropped without publishing, which means the resolve
-        // task itself died. Report it rather than hanging.
-        Err(_) => error(StatusCode::BAD_GATEWAY, "fetch task ended unexpectedly"),
+        // Every sender was dropped without publishing, which means the resolve
+        // task died -- `InflightGuard` clears the map entry, dropping the last
+        // one. Report it rather than leaving this and every later request for
+        // the coordinate waiting on a channel that will never send.
+        Err(_) => error(StatusCode::BAD_GATEWAY, "resolve task ended unexpectedly"),
+    }
+}
+
+/// Clears a coordinate from the in-flight map however the resolve ends.
+///
+/// The map owns the sender, so a task that ends without publishing would
+/// otherwise leave a live sender behind: `recv` never errors, and every later
+/// request for that coordinate subscribes to a channel nothing will ever send
+/// on and waits forever. Removing the entry from `Drop` drops that sender,
+/// which turns a dead resolve into an error the caller can see.
+struct InflightGuard {
+    state: Arc<AppState>,
+    key: String,
+}
+
+impl InflightGuard {
+    /// Take the sender out of the map, leaving nothing for `Drop` to do.
+    fn take(&self) -> Option<broadcast::Sender<Arc<Shared>>> {
+        self.state.inflight.lock().ok()?.remove(&self.key)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.state.inflight.lock() {
+            inflight.remove(&self.key);
+        }
     }
 }
 
@@ -330,12 +386,17 @@ async fn definition(
 /// Detached from any request on purpose -- see `AppState::inflight`.
 fn spawn_resolve(state: Arc<AppState>, coord: Coordinate, key: String) {
     tokio::spawn(async move {
+        let guard = InflightGuard {
+            state: state.clone(),
+            key: key.clone(),
+        };
+
         if let Some((def, ttl)) = read_from_disk(&state, &key).await {
             state.stats.disk_hits.fetch_add(1, Ordering::Relaxed);
             // Promote, with the TTL it has left rather than a fresh one: the
             // disk copy expires when it was always going to.
             state.cache.insert(key.clone(), def.clone(), ttl);
-            publish(&state, &key, Ok((def, Source::Disk))).await;
+            publish(&guard, Ok((def, ttl, Source::Disk)));
             return;
         }
 
@@ -351,36 +412,47 @@ fn spawn_resolve(state: Arc<AppState>, coord: Coordinate, key: String) {
                 if let Some(store) = &state.store {
                     store.put(&key, &def, ttl);
                 }
-                Ok((def, Source::Upstream))
+                Ok((def, ttl, Source::Upstream))
             }
             Err(FetchError::Upstream(code)) => {
-                // Upstream answered definitively. Not cached: it tells us
-                // nothing about the coordinate a later request would not
-                // re-learn.
+                // Upstream answered definitively, so this is not a retry-me.
+                // Pass 404 through as 404 and everything else as 502: a client
+                // that retries on 5xx would otherwise loop forever on a
+                // coordinate upstream will always reject, since nothing here
+                // is cached and every retry is a fresh fetch.
                 state.stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
-                Err(format!("upstream returned {code}"))
+                let status = match code {
+                    404 => StatusCode::NOT_FOUND,
+                    _ => StatusCode::BAD_GATEWAY,
+                };
+                Err(Failure {
+                    status,
+                    message: format!("upstream returned {code}"),
+                })
             }
             Err(e) => {
                 // Transient, and already retried. Never cached -- persisting a
                 // stall as "no data" is the failure this service exists to
-                // prevent.
+                // prevent. 504 is honest here: asking again may well work.
                 state.stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
-                Err(e.to_string())
+                Err(Failure {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: e.to_string(),
+                })
             }
         };
 
-        publish(&state, &key, outcome).await;
+        publish(&guard, outcome);
     });
 }
 
 /// Hand the result to everyone waiting and stop collecting new waiters.
 ///
-/// Removed from the map before publishing, so a request arriving after the
+/// Taken out of the map before publishing, so a request arriving after the
 /// result is sent starts a fresh resolve rather than subscribing to a channel
 /// that will never send again.
-async fn publish(state: &AppState, key: &str, outcome: Shared) {
-    let sender = state.inflight.lock().await.remove(key);
-    if let Some(tx) = sender {
+fn publish(guard: &InflightGuard, outcome: Shared) {
+    if let Some(tx) = guard.take() {
         let _ = tx.send(Arc::new(outcome));
     }
 }
@@ -399,14 +471,16 @@ async fn read_from_disk(state: &Arc<AppState>, key: &str) -> Option<(Definition,
         .flatten()
 }
 
-fn serve(def: Definition, source: Source) -> Response {
-    // The edge TTL follows the same split as the local one: an unharvested
-    // answer must not be pinned at a CDN for a month either.
-    let max_age = if def.harvested {
-        TTL_HARVESTED.as_secs()
-    } else {
-        TTL_UNHARVESTED.as_secs()
-    };
+/// `remaining` is what the entry has left to live, not the TTL it started with.
+///
+/// The edge TTL follows the same split as the local one -- an unharvested answer
+/// must not be pinned at a CDN for a month either -- but it has to shrink with
+/// the entry. Re-arming the full constant on every hit would let a CDN hold an
+/// entry for up to twice its intended life: an unharvested definition fetched
+/// again at five hours fifty-nine would be served as "no licence" for another
+/// six, long after upstream had harvested it.
+fn serve(def: Definition, remaining: Duration, source: Source) -> Response {
+    let max_age = remaining.as_secs();
     (
         StatusCode::OK,
         [
@@ -433,4 +507,187 @@ fn error(code: StatusCode, message: &str) -> Response {
         Json(serde_json::json!({ "error": message })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// A stand-in for api.clearlydefined.io that counts what reaches it.
+    ///
+    /// The counter is the point: collapsing and the disk tier are both claims
+    /// about how much upstream traffic a burst of requests produces, and
+    /// nothing else in the test suite can observe that.
+    async fn stub_upstream(hits: Arc<AtomicU64>, delay: Duration, status: StatusCode) -> String {
+        let handler = move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                // Long enough that callers pile up behind the first fetch
+                // rather than arriving after it has already finished.
+                tokio::time::sleep(delay).await;
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "licensed": {"declared": "MIT"},
+                        "described": {"tools": ["scancode/32.7.0"]},
+                        "scores": {"effective": 80}
+                    })),
+                )
+            }
+        };
+        let app = Router::new().route(
+            "/definitions/{kind}/{provider}/{namespace}/{name}/{revision}",
+            get(handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn state_for(upstream: String, capacity: usize, disk: Option<PathBuf>) -> Arc<AppState> {
+        Arc::new(AppState {
+            cache: Cache::new(capacity),
+            client: Client::new(reqwest::Client::new(), upstream, 1),
+            stats: Stats::default(),
+            inflight: std::sync::Mutex::new(HashMap::new()),
+            store: disk.map(|p| Store::open(&p, 0).unwrap()),
+        })
+    }
+
+    async fn serve_app(state: Arc<AppState>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state)).await;
+        });
+        format!("http://{addr}/v1/definitions")
+    }
+
+    fn temp_db() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "clearly-cached-main-{}-{}/definitions.redb",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_requests_for_one_coordinate_cause_one_fetch() {
+        // The measured regression this service was built around: with the
+        // fetch inline in the handler, 30 concurrent requests for one cold
+        // coordinate produced 10 upstream fetches, because callers that time
+        // out cancel the handler and abandon the fetch mid-flight.
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream =
+            stub_upstream(hits.clone(), Duration::from_millis(300), StatusCode::OK).await;
+        let base = serve_app(state_for(upstream, 1000, None)).await;
+
+        let url = format!("{base}/npm/npmjs/-/lodash/4.17.21");
+        let client = reqwest::Client::new();
+        let mut waiting = Vec::new();
+        for _ in 0..30 {
+            let client = client.clone();
+            let url = url.clone();
+            waiting.push(tokio::spawn(async move { client.get(url).send().await }));
+        }
+        for task in waiting {
+            let response = task.await.unwrap().unwrap();
+            assert_eq!(response.status(), 200);
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "collapsing did not hold");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_evicted_coordinate_comes_back_from_disk_not_upstream() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::ZERO, StatusCode::OK).await;
+        // Capacity of one, so the second coordinate evicts the first.
+        let base = serve_app(state_for(upstream, 1, Some(temp_db()))).await;
+        let client = reqwest::Client::new();
+
+        let cache_header = |r: &reqwest::Response| {
+            r.headers()
+                .get("x-cache")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned()
+        };
+
+        let first = client
+            .get(format!("{base}/npm/npmjs/-/lodash/4.17.21"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cache_header(&first), "MISS");
+
+        let second = client
+            .get(format!("{base}/pypi/pypi/-/requests/2.32.3"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cache_header(&second), "MISS");
+
+        let evicted = client
+            .get(format!("{base}/npm/npmjs/-/lodash/4.17.21"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cache_header(&evicted), "HIT-DISK");
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "the evicted coordinate went back upstream"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_definitive_upstream_rejection_is_not_reported_as_a_timeout() {
+        // 504 means "try again", and nothing here is cached, so a client that
+        // retries on 5xx would loop on a coordinate upstream always rejects.
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::ZERO, StatusCode::NOT_FOUND).await;
+        let base = serve_app(state_for(upstream, 100, None)).await;
+
+        let response = reqwest::get(format!("{base}/npm/npmjs/-/nope/1.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hit_does_not_re_arm_the_full_max_age() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::ZERO, StatusCode::OK).await;
+        let base = serve_app(state_for(upstream, 100, None)).await;
+        let url = format!("{base}/npm/npmjs/-/lodash/4.17.21");
+
+        let max_age = |r: &reqwest::Response| -> u64 {
+            let value = r
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            value
+                .split(',')
+                .find_map(|p| p.trim().strip_prefix("max-age="))
+                .and_then(|n| n.parse().ok())
+                .unwrap()
+        };
+
+        let first = max_age(&reqwest::get(&url).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let second = max_age(&reqwest::get(&url).await.unwrap());
+
+        assert!(first <= TTL_HARVESTED.as_secs());
+        assert!(
+            second < first,
+            "max-age was re-armed on a hit: {first} then {second}"
+        );
+    }
 }

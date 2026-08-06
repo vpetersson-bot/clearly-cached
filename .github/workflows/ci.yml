@@ -26,6 +26,11 @@ jobs:
       - run: cargo test --locked
 
   image:
+    # Gate the publish on the checks. Without this the two jobs race, and a
+    # commit that fails fmt, clippy or tests still pushes :latest and gets a
+    # signed provenance attestation -- which then certifies, verifiably, an
+    # image CI rejected.
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -75,7 +75,15 @@ Measured before that fix: 30 concurrent requests, 10 upstream fetches.
 **Splits the TTL by harvest state.** A harvested definition is held for 30 days;
 the coordinate is immutable and only a curation changes it. An unharvested one
 is held for 6 hours, so a package harvested tomorrow is not remembered as empty
-for a month. The `Cache-Control` sent to any CDN in front follows the same split.
+for a month. The `Cache-Control` sent to any CDN in front follows the same
+split, and counts down with the entry rather than re-arming on each hit — a full
+`max-age` on a nearly-expired entry would let the edge hold it for twice its
+intended life.
+
+**Reports upstream rejections as rejections.** A coordinate upstream refuses
+comes back as `404`, not `504`. Nothing here is cached, so answering a permanent
+error with a retry-me status would put a retrying client in a loop against an
+answer that will never change.
 
 **Forwards only known coordinates.** Type/provider pairs are an allow-list.
 Without one, any path under `/v1/` is reflected into an upstream URL and this
@@ -87,16 +95,21 @@ Memory holds what is hot. Disk holds everything.
 
 Eviction is a memory concern: when the map is full the oldest entries go, but
 they are still on disk, and reading one back is a local seek rather than a round
-trip to an upstream that stalls on 40% of cold requests. Nothing is evicted from
-disk — entries leave only when they expire, and a background sweep deletes them
-hourly.
+trip to an upstream that stalls on 40% of cold requests. Disk keeps what it is
+given — entries leave when they expire, swept hourly and once at startup.
 
 | | memory | disk |
 | --- | --- | --- |
 | holds | `CACHE_CAPACITY` entries | everything unexpired |
-| evicts | yes, when full | never |
+| evicts | yes, when full | only over `CACHE_DISK_MAX_ENTRIES` |
 | survives a restart | no | yes |
 | typical read | ~1 µs | ~100 µs |
+
+The disk cap is a backstop, not a working-set limit. ClearlyDefined answers 200
+for coordinates that do not exist, so without one a caller looping over random
+names writes a row per request until the volume fills; over the cap the sweep
+drops the soonest-to-expire entries, which were going to be re-fetched first
+anyway. Set it to `0` for genuinely unbounded.
 
 The `x-cache` header says which answered: `HIT` from memory, `HIT-DISK` from
 disk, `MISS` when it went upstream. `/stats` reports the same split, and
@@ -121,6 +134,7 @@ power cut costs a re-fetch, which is what a cache is for.
 | `CLEARLYDEFINED_UPSTREAM` | `https://api.clearlydefined.io` | Upstream base URL |
 | `CACHE_PATH` | `/var/cache/clearly-cached/definitions.redb` | Disk tier; set empty for memory only |
 | `CACHE_CAPACITY` | `200000` | Entries held in memory before eviction |
+| `CACHE_DISK_MAX_ENTRIES` | `2000000` | Disk ceiling; `0` for unbounded |
 | `UPSTREAM_ATTEMPTS` | `3` | Total attempts per fetch |
 | `UPSTREAM_TIMEOUT_SECS` | `15` | Per-attempt timeout |
 

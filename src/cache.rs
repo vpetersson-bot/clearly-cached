@@ -35,13 +35,19 @@ impl<V: Clone> Cache<V> {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<V> {
+    /// The value and the TTL it has left.
+    ///
+    /// The remaining lifetime is returned, not just the value, because it ends
+    /// up in `Cache-Control`: answering a hit with a fresh full TTL would let a
+    /// CDN hold an entry for up to twice as long as it is meant to live.
+    pub fn get(&self, key: &str) -> Option<(V, Duration)> {
         let entries = self.entries.read().ok()?;
         let entry = entries.get(key)?;
-        if entry.expires_at <= Instant::now() {
+        let now = Instant::now();
+        if entry.expires_at <= now {
             return None;
         }
-        Some(entry.value.clone())
+        Some((entry.value.clone(), entry.expires_at - now))
     }
 
     pub fn insert(&self, key: String, value: V, ttl: Duration) {
@@ -87,7 +93,21 @@ mod tests {
     fn returns_a_live_entry() {
         let c: Cache<u32> = Cache::new(10);
         c.insert("k".into(), 1, Duration::from_secs(60));
-        assert_eq!(c.get("k"), Some(1));
+        assert_eq!(c.get("k").map(|(v, _)| v), Some(1));
+    }
+
+    #[test]
+    fn reports_remaining_lifetime_not_the_original_ttl() {
+        // This is what ends up in Cache-Control, so a hit late in an entry's
+        // life must not hand a CDN a fresh full TTL.
+        let c: Cache<u32> = Cache::new(10);
+        c.insert("k".into(), 1, Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(20));
+        let (_, remaining) = c.get("k").expect("entry expired early");
+        assert!(
+            remaining < Duration::from_millis(60),
+            "TTL did not decay: {remaining:?}"
+        );
     }
 
     #[test]
@@ -106,8 +126,8 @@ mod tests {
         c.insert("short".into(), 1, Duration::from_millis(1));
         c.insert("long".into(), 2, Duration::from_secs(60));
         std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(c.get("short"), None);
-        assert_eq!(c.get("long"), Some(2));
+        assert!(c.get("short").is_none());
+        assert_eq!(c.get("long").map(|(v, _)| v), Some(2));
     }
 
     #[test]

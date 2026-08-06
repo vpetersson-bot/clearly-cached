@@ -137,14 +137,22 @@ impl Coordinate {
 /// Rejects traversal and separators outright rather than escaping them: every
 /// legitimate coordinate is already within this set, so anything outside it is
 /// a probe rather than a package.
+///
+/// `%` is excluded, and that exclusion is the whole guard rather than a
+/// tidiness rule. Axum decodes a captured segment once, so `%252e%252e%252f`
+/// reaches here as `%2e%2e%2f`; allowing `%` would let that through, and the
+/// URL crate does not normalise percent-encoded dot-segments, so it would
+/// arrive at upstream intact and be decoded there during routing. The result is
+/// a request for a different endpoint, projected and cached under the
+/// coordinate the caller named -- which is this service acting as the general
+/// proxy the allow-list exists to prevent.
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 256
         && s != "."
         && s != ".."
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | '~' | '%')
-        })
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | '~'))
 }
 
 /// Hosts whose URLs are repositories. Everything else upstream puts in
@@ -157,10 +165,22 @@ const VCS_HOSTS: &[&str] = &[
     "sr.ht",
 ];
 
+/// Schemes a repository URL can plausibly carry.
+///
+/// Checked because `sourceLocation.url` comes from community-submitted
+/// curations and this field is served to consumers that render it as a link.
+/// `javascript://github.com/%0aalert(1)` has a VCS host and no archive
+/// extension, so without a scheme check it would be published as a repository.
+const VCS_SCHEMES: &[&str] = &["https", "http", "git", "git+https", "git+ssh", "ssh"];
+
 fn is_vcs_url(url: &str) -> bool {
-    let Some(rest) = url.split_once("://").map(|(_, r)| r) else {
+    let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
+    let scheme = scheme.to_ascii_lowercase();
+    if !VCS_SCHEMES.contains(&scheme.as_str()) {
+        return false;
+    }
     let host = rest
         .split(['/', '?', '#'])
         .next()
@@ -372,6 +392,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_percent_encoded_traversal() {
+        // What arrives after axum has decoded the path once, which is what a
+        // caller sending %252e%252e%252f produces. Left intact these reach
+        // upstream still encoded and are decoded there, addressing a different
+        // endpoint under the coordinate the caller named.
+        for bad in ["%2e%2e%2fcurations", "%2F", "a%00b", "%2e%2e"] {
+            assert!(
+                Coordinate::parse("pypi", "pypi", "-", bad, "1").is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_attribution_from_the_core_facet() {
         // The whole reason this projection exists: licensed.attribution is
         // unset upstream, and reading it returns nothing.
@@ -430,6 +464,11 @@ mod tests {
             "https://pypi.org/project/requests/2.32.3/",
             "https://notgithub.com/evil/repo",
             "https://example.com/?ref=github.com",
+            // Curations are community-submitted and this field gets rendered
+            // as a link, so the scheme has to be checked too.
+            "javascript://github.com/%0aalert(document.domain)",
+            "data://github.com/x",
+            "javascript:alert(1)",
         ] {
             let doc = json!({"described": {"sourceLocation": {"url": not_repo}}});
             assert_eq!(normalise(&doc).source_url, None, "accepted {not_repo}");
