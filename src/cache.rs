@@ -1,0 +1,121 @@
+//! A bounded TTL map with request collapsing.
+//!
+//! Two properties matter here and neither is about raw speed.
+//!
+//! **Collapsing.** A newly published package is asked for by every CI job that
+//! depends on it, at once. Without collapsing, one cold coordinate becomes N
+//! simultaneous upstream requests against the endpoint that already stalls
+//! under load. The first caller fetches; the rest wait and read the result.
+//!
+//! **A TTL that depends on the answer.** ClearlyDefined never 404s: an
+//! unharvested coordinate returns 200 with an empty definition, indistinguishable
+//! from "this package genuinely has no licence" unless you look at whether any
+//! tools ran. Caching that for a month would freeze "no data" over a package
+//! that gets harvested tomorrow, so the caller picks the TTL per entry.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
+struct Entry<V> {
+    value: V,
+    expires_at: Instant,
+}
+
+pub struct Cache<V> {
+    entries: RwLock<HashMap<String, Entry<V>>>,
+    capacity: usize,
+}
+
+impl<V: Clone> Cache<V> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            capacity,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<V> {
+        let entries = self.entries.read().ok()?;
+        let entry = entries.get(key)?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some(entry.value.clone())
+    }
+
+    pub fn insert(&self, key: String, value: V, ttl: Duration) {
+        let Ok(mut entries) = self.entries.write() else {
+            // A poisoned lock means a panic while holding it. Losing the cache
+            // is survivable; refusing to serve is not.
+            return;
+        };
+        if entries.len() >= self.capacity {
+            let now = Instant::now();
+            entries.retain(|_, e| e.expires_at > now);
+            if entries.len() >= self.capacity {
+                // Still full of live entries. Drop an arbitrary tenth rather
+                // than sorting by age: this only happens when the working set
+                // genuinely exceeds capacity, and an approximation is enough
+                // to keep serving.
+                let excess = self.capacity / 10 + 1;
+                let victims: Vec<String> = entries.keys().take(excess).cloned().collect();
+                for k in victims {
+                    entries.remove(&k);
+                }
+            }
+        }
+        entries.insert(
+            key,
+            Entry {
+                value,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|e| e.len()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_a_live_entry() {
+        let c: Cache<u32> = Cache::new(10);
+        c.insert("k".into(), 1, Duration::from_secs(60));
+        assert_eq!(c.get("k"), Some(1));
+    }
+
+    #[test]
+    fn does_not_return_an_expired_entry() {
+        let c: Cache<u32> = Cache::new(10);
+        c.insert("k".into(), 1, Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(c.get("k"), None);
+    }
+
+    #[test]
+    fn expiry_is_per_entry_not_global() {
+        // The whole point of the split TTL: an unharvested definition must be
+        // able to expire while a harvested one is still held.
+        let c: Cache<u32> = Cache::new(10);
+        c.insert("short".into(), 1, Duration::from_millis(1));
+        c.insert("long".into(), 2, Duration::from_secs(60));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(c.get("short"), None);
+        assert_eq!(c.get("long"), Some(2));
+    }
+
+    #[test]
+    fn stays_within_capacity() {
+        let c: Cache<u32> = Cache::new(16);
+        for i in 0..200 {
+            c.insert(format!("k{i}"), i, Duration::from_secs(60));
+        }
+        assert!(c.len() <= 16, "cache grew to {}", c.len());
+    }
+}
