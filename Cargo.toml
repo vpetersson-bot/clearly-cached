@@ -12,11 +12,13 @@ repository = "https://github.com/sbomify/clearly-cached"
 #   axum/tokio  the server
 #   reqwest     upstream fetches, rustls so the image needs no system OpenSSL
 #   serde_json  we parse ~189KB upstream documents to emit ~400 bytes
+#   redb        the disk tier; pure Rust, no C, keeps its index off the heap
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "gzip", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+redb = "4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

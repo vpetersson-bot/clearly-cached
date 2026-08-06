@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const UPSTREAM: &str = "https://api.clearlydefined.io";
 
@@ -43,7 +43,10 @@ const ALLOWED_TYPES: &[(&str, &str)] = &[
 ];
 
 /// The projection clients actually consume.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+///
+/// `Deserialize` for the on-disk cache only: nothing upstream is parsed into
+/// this type, it is built field by field in `normalise`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Definition {
     /// SPDX expression as declared, or None when nothing was found.
     pub declared: Option<String>,

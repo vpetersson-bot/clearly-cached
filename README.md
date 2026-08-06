@@ -77,16 +77,41 @@ the coordinate is immutable and only a curation changes it. An unharvested one
 is held for 6 hours, so a package harvested tomorrow is not remembered as empty
 for a month. The `Cache-Control` sent to any CDN in front follows the same split.
 
-**Holds the cache in memory only.** A bounded map, `CACHE_CAPACITY` entries,
-nothing on disk — so a restart or a redeploy starts cold and the next request
-for each coordinate goes upstream again. At ~0.4KB per entry the default 200k
-ceiling is roughly 80MB of definitions, small enough that persistence buys
-little: the CDN in front absorbs a cold start, and the entries that matter are
-re-fetched within minutes of traffic resuming.
-
 **Forwards only known coordinates.** Type/provider pairs are an allow-list.
 Without one, any path under `/v1/` is reflected into an upstream URL and this
 becomes a general-purpose proxy for whoever finds it.
+
+## The two tiers
+
+Memory holds what is hot. Disk holds everything.
+
+Eviction is a memory concern: when the map is full the oldest entries go, but
+they are still on disk, and reading one back is a local seek rather than a round
+trip to an upstream that stalls on 40% of cold requests. Nothing is evicted from
+disk — entries leave only when they expire, and a background sweep deletes them
+hourly.
+
+| | memory | disk |
+| --- | --- | --- |
+| holds | `CACHE_CAPACITY` entries | everything unexpired |
+| evicts | yes, when full | never |
+| survives a restart | no | yes |
+| typical read | ~1 µs | ~100 µs |
+
+The `x-cache` header says which answered: `HIT` from memory, `HIT-DISK` from
+disk, `MISS` when it went upstream. `/stats` reports the same split, and
+`disk_hits` is the number that says whether the disk tier is earning its keep.
+
+Concurrent requests for one cold coordinate collapse onto a single resolve, so
+thirty simultaneous callers cause one disk read, or one upstream fetch, not
+thirty.
+
+The disk tier is [redb](https://github.com/cberner/redb) — pure Rust, no C, and
+it keeps its index on disk. An append-only log would have been less code, but
+reading from it at random needs an in-memory index over every key, which
+reintroduces the memory ceiling the split exists to escape. Writes are batched
+onto a background thread and never block a response; losing the last batch to a
+power cut costs a re-fetch, which is what a cache is for.
 
 ## Configuration
 
@@ -94,15 +119,24 @@ becomes a general-purpose proxy for whoever finds it.
 | --- | --- | --- |
 | `LISTEN_ADDR` | `0.0.0.0:8080` | Listen address |
 | `CLEARLYDEFINED_UPSTREAM` | `https://api.clearlydefined.io` | Upstream base URL |
-| `CACHE_CAPACITY` | `200000` | Maximum entries held in process |
+| `CACHE_PATH` | `/var/cache/clearly-cached/definitions.redb` | Disk tier; set empty for memory only |
+| `CACHE_CAPACITY` | `200000` | Entries held in memory before eviction |
 | `UPSTREAM_ATTEMPTS` | `3` | Total attempts per fetch |
 | `UPSTREAM_TIMEOUT_SECS` | `15` | Per-attempt timeout |
+
+If `CACHE_PATH` cannot be opened the service logs it and runs memory-only rather
+than refusing to start — a missing volume should not be an outage.
 
 ## Running
 
 ```console
-$ docker run -p 8080:8080 ghcr.io/sbomify/clearly-cached:latest
+$ docker run -p 8080:8080 \
+    -v clearly-cached:/var/cache/clearly-cached \
+    ghcr.io/sbomify/clearly-cached:latest
 ```
+
+The volume is what makes the disk tier outlive the container. Without one the
+cache still survives a restart, but not a `docker rm`.
 
 The image is a static musl binary on `scratch` — about 5.5MB, no shell, no
 package manager, running as uid 65532. TLS roots are compiled in, so there is

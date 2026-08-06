@@ -1,0 +1,35 @@
+---
+version: 2
+updates:
+  # Grouped per ecosystem, matching sbomify-action: this repo has few enough
+  # dependencies that one PR a week is easier to review than five.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  # CI pins actions by commit SHA, which is what makes a provenance attestation
+  # mean anything. Dependabot moves the pin and the trailing version comment
+  # together; without it the pins quietly rot.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # The Rust toolchain image the binary is built with.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker:
+        patterns:
+          - "*"
