@@ -77,6 +77,13 @@ the coordinate is immutable and only a curation changes it. An unharvested one
 is held for 6 hours, so a package harvested tomorrow is not remembered as empty
 for a month. The `Cache-Control` sent to any CDN in front follows the same split.
 
+**Holds the cache in memory only.** A bounded map, `CACHE_CAPACITY` entries,
+nothing on disk — so a restart or a redeploy starts cold and the next request
+for each coordinate goes upstream again. At ~0.4KB per entry the default 200k
+ceiling is roughly 80MB of definitions, small enough that persistence buys
+little: the CDN in front absorbs a cold start, and the entries that matter are
+re-fetched within minutes of traffic resuming.
+
 **Forwards only known coordinates.** Type/provider pairs are an allow-list.
 Without one, any path under `/v1/` is reflected into an upstream URL and this
 becomes a general-purpose proxy for whoever finds it.
@@ -94,8 +101,7 @@ becomes a general-purpose proxy for whoever finds it.
 ## Running
 
 ```console
-$ docker build -t clearly-cached .
-$ docker run -p 8080:8080 clearly-cached
+$ docker run -p 8080:8080 ghcr.io/sbomify/clearly-cached:latest
 ```
 
 The image is a static musl binary on `scratch` — about 5.5MB, no shell, no
@@ -104,6 +110,23 @@ no system certificate store to mount.
 
 It is designed to sit behind a CDN. The edge does the geographic work; this
 process does the normalising and the collapsing.
+
+### Verifying it
+
+Every pushed image carries a [SLSA v1 build-provenance
+attestation](https://github.com/actions/attest-build-provenance), signed through
+the public-good Sigstore instance and recorded in the public transparency log.
+
+```console
+$ gh attestation verify oci://ghcr.io/sbomify/clearly-cached:latest \
+    --repo sbomify/clearly-cached
+```
+
+That binds the image digest to the workflow, commit and runner that produced it.
+The image is `scratch` plus one static binary, so verifying the image verifies
+the binary — there is nothing else in it to account for. The attestation is
+pushed to the registry alongside the image, so `cosign verify-attestation` works
+against a pull alone, without consulting the GitHub API.
 
 ## Scope
 
