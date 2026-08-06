@@ -1,0 +1,105 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  image:
+    # Gate the publish on the checks. Without this the two jobs race, and a
+    # commit that fails fmt, clippy or tests still pushes :latest and gets a
+    # signed provenance attestation -- which then certifies, verifiably, an
+    # image CI rejected.
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # push the image to GHCR
+      id-token: write       # mint the OIDC token Sigstore signs against
+      attestations: write   # record the attestation against this repo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      # Pull requests build but do not push: a fork PR has no write
+      # credentials, and an unreviewed image should not reach the registry.
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - name: Build
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # -----------------------------------------------------------------------
+      # Build-provenance attestation (SLSA v1)
+      # -----------------------------------------------------------------------
+      # Binds the image digest to this workflow, this commit and this runner,
+      # signed via the public-good Sigstore instance and recorded in the public
+      # transparency log. The image is `scratch` plus one static binary, so
+      # verifying the image is verifying the binary -- there is nothing else in
+      # it to account for.
+      #
+      # push-to-registry stores the attestation alongside the image, so it can
+      # be verified from a pull alone without consulting the GitHub API.
+      #
+      # Where this step is supported:
+      #   * Public repository on any GitHub plan (Free, Pro, Team, Enterprise)
+      #     -- uses the public-good Sigstore instance (Fulcio + Rekor).
+      #   * Private / internal repository on GitHub Enterprise Cloud
+      #     -- uses GitHub's private Sigstore instance (scoped to the repo).
+      # Where it is NOT supported and the workflow will fail:
+      #   * Private / internal repository on GitHub Free, Pro, or Team.
+      #   * Any repository on GitHub Enterprise Server (self-hosted).
+      # This repo is public, which is the first case.
+      # Reference: https://github.com/actions/attest-build-provenance
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

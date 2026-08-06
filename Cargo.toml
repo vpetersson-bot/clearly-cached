@@ -1,0 +1,31 @@
+[package]
+name = "clearly-cached"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "AGPL-3.0-or-later"
+description = "Caching, normalising front end for the ClearlyDefined definitions API"
+repository = "https://github.com/sbomify/clearly-cached"
+
+[dependencies]
+# Deliberately few. Everything here earns its place:
+#   axum/tokio  the server
+#   reqwest     upstream fetches, rustls so the image needs no system OpenSSL
+#   serde_json  we parse ~189KB upstream documents to emit ~400 bytes
+#   redb        the disk tier; pure Rust, no C, keeps its index off the heap
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "gzip", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+redb = "4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
