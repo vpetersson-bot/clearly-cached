@@ -6,6 +6,10 @@ on:
     branches: [master]
     tags: ['v*']
   pull_request:
+  # A workflow with no runs has no button to start one, so the only way to try
+  # is another commit. Worth having regardless as a re-run for cases a push
+  # cannot cover.
+  workflow_dispatch:
 
 permissions:
   contents: read
