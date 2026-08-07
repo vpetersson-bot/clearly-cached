@@ -62,9 +62,11 @@ Also available: `GET /healthz`, `GET /stats`.
 
 ## Behaviour
 
-**Retries transient failures.** Timeouts, 429s and 5xx are retried with a short
-linear backoff. Nothing transient is ever cached: persisting a stall as "no
-data" is the failure this service exists to prevent.
+**Retries transient failures, within a deadline.** Timeouts, 429s and 5xx are
+retried with a short linear backoff, but never past `UPSTREAM_DEADLINE_SECS` in
+total — attempts alone are not a bound, and a caller that has already given up
+is not helped by an answer arriving later. Nothing transient is ever cached:
+persisting a stall as "no data" is the failure this service exists to prevent.
 
 **Collapses concurrent misses.** Thirty simultaneous requests for one cold
 coordinate produce one upstream fetch. The fetch runs detached from the request
@@ -136,7 +138,8 @@ power cut costs a re-fetch, which is what a cache is for.
 | `CACHE_CAPACITY` | `200000` | Entries held in memory before eviction |
 | `CACHE_DISK_MAX_ENTRIES` | `2000000` | Disk ceiling; `0` for unbounded |
 | `UPSTREAM_ATTEMPTS` | `3` | Total attempts per fetch |
-| `UPSTREAM_TIMEOUT_SECS` | `15` | Per-attempt timeout |
+| `UPSTREAM_TIMEOUT_SECS` | `8` | Per-attempt timeout |
+| `UPSTREAM_DEADLINE_SECS` | `25` | Ceiling across all attempts |
 
 If `CACHE_PATH` cannot be opened the service logs it and runs memory-only rather
 than refusing to start — a missing volume should not be an outage.
