@@ -1,1 +1,6 @@
 target/
+
+# Core dumps. A crashed process inside a bind-mounted container writes them
+# here, and they are large enough to notice only after the push.
+*.core
+core.*
