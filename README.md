@@ -152,9 +152,27 @@ $ docker run -p 8080:8080 \
 The volume is what makes the disk tier outlive the container. Without one the
 cache still survives a restart, but not a `docker rm`.
 
-The image is a static musl binary on `scratch` — about 5.5MB, no shell, no
+The image is a static musl binary on `scratch` — about 6.5MB, no shell, no
 package manager, running as uid 65532. TLS roots are compiled in, so there is
 no system certificate store to mount.
+
+`linux/amd64` and `linux/arm64` are both published under the same tags, so a
+pull resolves to the right one. Each is built on a native runner rather than
+under emulation.
+
+### Without Docker
+
+Static binaries for both architectures are attached to every release, and to
+every CI run as artifacts:
+
+```console
+$ curl -fsSLO https://github.com/sbomify/clearly-cached/releases/latest/download/clearly-cached-x86_64-unknown-linux-musl
+$ chmod +x clearly-cached-*
+$ CACHE_PATH=./definitions.redb ./clearly-cached-x86_64-unknown-linux-musl
+```
+
+They link nothing — no libc, no OpenSSL — so they run on any Linux of the right
+architecture. Swap `x86_64` for `aarch64` on arm64.
 
 It is designed to sit behind a CDN. The edge does the geographic work; this
 process does the normalising and the collapsing.
@@ -168,13 +186,17 @@ the public-good Sigstore instance and recorded in the public transparency log.
 ```console
 $ gh attestation verify oci://ghcr.io/sbomify/clearly-cached:latest \
     --repo sbomify/clearly-cached
+
+$ gh attestation verify ./clearly-cached-aarch64-unknown-linux-musl \
+    --repo sbomify/clearly-cached
 ```
 
-That binds the image digest to the workflow, commit and runner that produced it.
-The image is `scratch` plus one static binary, so verifying the image verifies
-the binary — there is nothing else in it to account for. The attestation is
-pushed to the registry alongside the image, so `cosign verify-attestation` works
-against a pull alone, without consulting the GitHub API.
+That binds the digest to the workflow, commit and runner that produced it. For
+the image it is the manifest list that is attested — what a tag actually
+resolves to — and the image is `scratch` plus one static binary, so verifying it
+verifies the binary. The image attestation is pushed to the registry alongside
+the image, so `cosign verify-attestation` works against a pull alone, without
+consulting the GitHub API.
 
 ## Scope
 
