@@ -2,7 +2,9 @@
 name = "clearly-cached"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+# What the image builds with and what CI lints and tests with. Nothing checks
+# an older floor, so claiming one would be a guess.
+rust-version = "1.97"
 license = "AGPL-3.0-or-later"
 description = "Caching, normalising front end for the ClearlyDefined definitions API"
 repository = "https://github.com/sbomify/clearly-cached"

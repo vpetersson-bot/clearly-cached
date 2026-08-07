@@ -187,8 +187,8 @@ impl<V> Drop for Store<V> {
 fn run_writer(db: Arc<Database>, rx: Receiver<Msg>, max_entries: u64) {
     let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
 
-    loop {
-        let Ok(msg) = rx.recv() else { break };
+    // Ends when every sender is gone, which happens when the store is dropped.
+    while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Put(key, bytes) => {
                 pending.push((key, bytes));
