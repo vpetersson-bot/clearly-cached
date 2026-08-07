@@ -18,6 +18,7 @@
 //! and re-serves it. That is a property of this source specifically and does not
 //! generalise to the other sources sbomify-action reads.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -115,8 +116,9 @@ impl Coordinate {
                 return Err(FetchError::Rejected("invalid coordinate segment"));
             }
         }
-        // Held decoded, as they arrived. Encoding happens once, in cache_key,
-        // so the key and the upstream path are the same string by construction.
+        // Stored exactly as they arrived from axum, which is to say decoded.
+        // Encoding happens in one place, `cache_key`, so the cache key and the
+        // upstream path cannot disagree about how a slash is spelt.
         Ok(Self {
             kind: kind.to_owned(),
             provider: provider.to_owned(),
@@ -143,11 +145,24 @@ impl Coordinate {
     }
 }
 
-fn encode_slashes(s: &str) -> String {
-    s.replace('/', "%2f")
+/// Borrows unless there is actually a slash to encode.
+///
+/// Called three times per `cache_key`, and `cache_key` runs on every request,
+/// while only Go coordinates contain a slash at all -- so the common case
+/// should not allocate to hand back what it was given.
+fn encode_slashes(s: &str) -> Cow<'_, str> {
+    if s.contains('/') {
+        Cow::Owned(s.replace('/', "%2f"))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
-/// Segments that can be placed in an upstream path without changing its shape.
+/// Segments that may be interpolated into an upstream path.
+///
+/// The shape of that path is preserved by this function and `encode_slashes`
+/// together, not by this one alone: a slash is permitted here and re-encoded
+/// there, so it stays inside a single segment rather than becoming a new one.
 ///
 /// Segments arrive already percent-decoded once, by axum. That is what makes
 /// both halves of this work.
