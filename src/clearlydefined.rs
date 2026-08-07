@@ -338,20 +338,30 @@ pub struct Client {
     http: reqwest::Client,
     upstream: String,
     attempts: u32,
+    /// Ceiling on everything one resolve may spend upstream.
+    ///
+    /// Attempts alone do not bound it: three at fifteen seconds each is a
+    /// forty-five second wait. Measured against the deployment, cold misses on
+    /// a stalling coordinate ran past 45s and returned nothing at all -- long
+    /// past the point a CI client has given up and asked again, so the wait
+    /// bought nothing and cost upstream another fetch.
+    deadline: Duration,
 }
 
 impl Client {
-    pub fn new(http: reqwest::Client, upstream: String, attempts: u32) -> Self {
+    pub fn new(http: reqwest::Client, upstream: String, attempts: u32, deadline: Duration) -> Self {
         Self {
             http,
             upstream,
             attempts: attempts.max(1),
+            deadline,
         }
     }
 
     pub async fn fetch(&self, coord: &Coordinate) -> Result<Definition, FetchError> {
         let url = format!("{}/definitions/{}", self.upstream, coord.cache_key());
         let mut last = FetchError::Transient("no attempt made".into());
+        let started = std::time::Instant::now();
 
         for attempt in 0..self.attempts {
             if attempt > 0 {
@@ -360,13 +370,32 @@ impl Client {
                 // than the failure it is pacing.
                 tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
             }
-            match self.try_once(&url).await {
-                Ok(def) => return Ok(def),
-                Err(FetchError::Transient(m)) => last = FetchError::Transient(m),
-                Err(other) => return Err(other),
+
+            // Only what is left of the budget, so a final attempt is cut short
+            // rather than allowed to carry the total past the deadline.
+            let remaining = self.deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(self.expired(started));
+            }
+
+            match tokio::time::timeout(remaining, self.try_once(&url)).await {
+                Ok(Ok(def)) => return Ok(def),
+                Ok(Err(FetchError::Transient(m))) => last = FetchError::Transient(m),
+                Ok(Err(other)) => return Err(other),
+                Err(_) => return Err(self.expired(started)),
             }
         }
         Err(last)
+    }
+
+    fn expired(&self, started: std::time::Instant) -> FetchError {
+        // Transient on purpose: nothing is learned about the coordinate, so
+        // nothing is cached and asking again is reasonable.
+        FetchError::Transient(format!(
+            "no answer within {:.0}s (spent {:.1}s)",
+            self.deadline.as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        ))
     }
 
     async fn try_once(&self, url: &str) -> Result<Definition, FetchError> {
