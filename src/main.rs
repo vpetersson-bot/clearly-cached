@@ -148,7 +148,13 @@ async fn main() {
         .unwrap_or_else(|_| clearlydefined::UPSTREAM.into());
     let capacity = env_u64("CACHE_CAPACITY", 200_000) as usize;
     let attempts = env_u64("UPSTREAM_ATTEMPTS", 3) as u32;
-    let timeout = Duration::from_secs(env_u64("UPSTREAM_TIMEOUT_SECS", 15));
+    // Per attempt, and then across all of them. The second is the one that
+    // matters to a caller: attempts x timeout was a 45-second worst case, and
+    // measured against the deployment cold misses on a stalling coordinate ran
+    // past 45s and returned nothing. A client that has already given up is not
+    // helped by an answer arriving later.
+    let timeout = Duration::from_secs(env_u64("UPSTREAM_TIMEOUT_SECS", 8));
+    let deadline = Duration::from_secs(env_u64("UPSTREAM_DEADLINE_SECS", 25));
 
     let http = reqwest::Client::builder()
         .timeout(timeout)
@@ -192,7 +198,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         cache: Cache::new(capacity),
-        client: Client::new(http, upstream.clone(), attempts),
+        client: Client::new(http, upstream.clone(), attempts, deadline),
         stats: Stats::default(),
         inflight: std::sync::Mutex::new(HashMap::new()),
         store,
@@ -550,9 +556,18 @@ mod tests {
     }
 
     fn state_for(upstream: String, capacity: usize, disk: Option<PathBuf>) -> Arc<AppState> {
+        state_with_deadline(upstream, capacity, disk, Duration::from_secs(30))
+    }
+
+    fn state_with_deadline(
+        upstream: String,
+        capacity: usize,
+        disk: Option<PathBuf>,
+        deadline: Duration,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             cache: Cache::new(capacity),
-            client: Client::new(reqwest::Client::new(), upstream, 1),
+            client: Client::new(reqwest::Client::new(), upstream, 3, deadline),
             stats: Stats::default(),
             inflight: std::sync::Mutex::new(HashMap::new()),
             store: disk.map(|p| Store::open(&p, 0).unwrap()),
@@ -658,6 +673,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalling_upstream_is_bounded_by_the_deadline() {
+        // Attempts alone do not bound the wait, and a caller that has already
+        // given up is not helped by an answer arriving later. Against the
+        // deployment this was a 45s worst case that returned nothing.
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::from_secs(60), StatusCode::OK).await;
+        let base = serve_app(state_with_deadline(
+            upstream,
+            100,
+            None,
+            Duration::from_secs(2),
+        ))
+        .await;
+
+        let started = std::time::Instant::now();
+        let response = reqwest::get(format!("{base}/npm/npmjs/-/stalls/1.0.0"))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), 504);
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "waited {elapsed:?} on a 2s deadline"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

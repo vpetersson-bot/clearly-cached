@@ -115,6 +115,8 @@ impl Coordinate {
                 return Err(FetchError::Rejected("invalid coordinate segment"));
             }
         }
+        // Held decoded, as they arrived. Encoding happens once, in cache_key,
+        // so the key and the upstream path are the same string by construction.
         Ok(Self {
             kind: kind.to_owned(),
             provider: provider.to_owned(),
@@ -124,34 +126,56 @@ impl Coordinate {
         })
     }
 
+    /// The upstream path, and the cache key -- deliberately the same string.
+    ///
+    /// Slashes inside a segment are re-encoded: upstream expects a Go module
+    /// path as one segment with `%2f` separators, and sending the decoded form
+    /// would add path components and shift every segment after it.
     pub fn cache_key(&self) -> String {
         format!(
             "{}/{}/{}/{}/{}",
-            self.kind, self.provider, self.namespace, self.name, self.revision
+            self.kind,
+            self.provider,
+            encode_slashes(&self.namespace),
+            encode_slashes(&self.name),
+            encode_slashes(&self.revision)
         )
     }
 }
 
+fn encode_slashes(s: &str) -> String {
+    s.replace('/', "%2f")
+}
+
 /// Segments that can be placed in an upstream path without changing its shape.
 ///
-/// Rejects traversal and separators outright rather than escaping them: every
-/// legitimate coordinate is already within this set, so anything outside it is
-/// a probe rather than a package.
+/// Segments arrive already percent-decoded once, by axum. That is what makes
+/// both halves of this work.
 ///
-/// `%` is excluded, and that exclusion is the whole guard rather than a
-/// tidiness rule. Axum decodes a captured segment once, so `%252e%252e%252f`
-/// reaches here as `%2e%2e%2f`; allowing `%` would let that through, and the
-/// URL crate does not normalise percent-encoded dot-segments, so it would
-/// arrive at upstream intact and be decoded there during routing. The result is
-/// a request for a different endpoint, projected and cached under the
-/// coordinate the caller named -- which is this service acting as the general
-/// proxy the allow-list exists to prevent.
+/// A slash is allowed *within* a segment, because a Go module path is one
+/// coordinate segment containing slashes: upstream addresses it as
+/// `go/golang/github.com%2fpkg/errors/v0.9.1`, which reaches here as
+/// `github.com/pkg`. Refusing it makes every Go coordinate unaddressable. Each
+/// part between slashes is validated on its own, so `..` cannot hide in one.
+///
+/// A leftover `%` is refused, and that is the guard. No legitimate coordinate
+/// still contains an escape after one decode, so a `%` here means the caller
+/// encoded twice -- `%252e%252e%252f` arrives as `%2e%2e%2f` -- and forwarding
+/// that would let upstream decode it a second time, addressing a different
+/// endpoint under the coordinate the caller named.
 fn is_safe_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 256
-        && s != "."
-        && s != ".."
-        && s.chars()
+    if s.is_empty() || s.len() > 256 || s.contains('%') {
+        return false;
+    }
+    s.split('/').all(is_safe_part)
+}
+
+fn is_safe_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | '~'))
 }
 
@@ -314,20 +338,30 @@ pub struct Client {
     http: reqwest::Client,
     upstream: String,
     attempts: u32,
+    /// Ceiling on everything one resolve may spend upstream.
+    ///
+    /// Attempts alone do not bound it: three at fifteen seconds each is a
+    /// forty-five second wait. Measured against the deployment, cold misses on
+    /// a stalling coordinate ran past 45s and returned nothing at all -- long
+    /// past the point a CI client has given up and asked again, so the wait
+    /// bought nothing and cost upstream another fetch.
+    deadline: Duration,
 }
 
 impl Client {
-    pub fn new(http: reqwest::Client, upstream: String, attempts: u32) -> Self {
+    pub fn new(http: reqwest::Client, upstream: String, attempts: u32, deadline: Duration) -> Self {
         Self {
             http,
             upstream,
             attempts: attempts.max(1),
+            deadline,
         }
     }
 
     pub async fn fetch(&self, coord: &Coordinate) -> Result<Definition, FetchError> {
         let url = format!("{}/definitions/{}", self.upstream, coord.cache_key());
         let mut last = FetchError::Transient("no attempt made".into());
+        let started = std::time::Instant::now();
 
         for attempt in 0..self.attempts {
             if attempt > 0 {
@@ -336,13 +370,32 @@ impl Client {
                 // than the failure it is pacing.
                 tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
             }
-            match self.try_once(&url).await {
-                Ok(def) => return Ok(def),
-                Err(FetchError::Transient(m)) => last = FetchError::Transient(m),
-                Err(other) => return Err(other),
+
+            // Only what is left of the budget, so a final attempt is cut short
+            // rather than allowed to carry the total past the deadline.
+            let remaining = self.deadline.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(self.expired(started));
+            }
+
+            match tokio::time::timeout(remaining, self.try_once(&url)).await {
+                Ok(Ok(def)) => return Ok(def),
+                Ok(Err(FetchError::Transient(m))) => last = FetchError::Transient(m),
+                Ok(Err(other)) => return Err(other),
+                Err(_) => return Err(self.expired(started)),
             }
         }
         Err(last)
+    }
+
+    fn expired(&self, started: std::time::Instant) -> FetchError {
+        // Transient on purpose: nothing is learned about the coordinate, so
+        // nothing is cached and asking again is reasonable.
+        FetchError::Transient(format!(
+            "no answer within {:.0}s (spent {:.1}s)",
+            self.deadline.as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        ))
     }
 
     async fn try_once(&self, url: &str) -> Result<Definition, FetchError> {
@@ -382,8 +435,9 @@ mod tests {
 
     #[test]
     fn rejects_traversal_and_separators() {
-        // The allow-list is what stops this becoming an open proxy.
-        for bad in ["..", ".", "a/b", "a?b", "a#b", "", "a b"] {
+        // The allow-list is what stops this becoming an open proxy. A bare
+        // slash is absent from this list on purpose -- see go_module_paths.
+        for bad in ["..", ".", "a?b", "a#b", "", "a b", "a\\b", "a:b"] {
             assert!(
                 Coordinate::parse("pypi", "pypi", "-", bad, "1").is_err(),
                 "accepted {bad:?}"
@@ -393,16 +447,45 @@ mod tests {
 
     #[test]
     fn rejects_percent_encoded_traversal() {
-        // What arrives after axum has decoded the path once, which is what a
-        // caller sending %252e%252e%252f produces. Left intact these reach
-        // upstream still encoded and are decoded there, addressing a different
-        // endpoint under the coordinate the caller named.
-        for bad in ["%2e%2e%2fcurations", "%2F", "a%00b", "%2e%2e"] {
+        // These are what a double-encoded probe looks like after axum's one
+        // decode. A leftover % means the caller encoded twice, and forwarding
+        // it would let upstream decode it again into a different path.
+        for bad in [
+            "%2e%2e%2fcurations",
+            "a%00b",
+            "%2e%2e",
+            "%2fetc%2fpasswd",
+            // Traversal in the decoded form, part by part.
+            "a/../b",
+            "../curations",
+            "/etc/passwd",
+            "a//b",
+        ] {
             assert!(
                 Coordinate::parse("pypi", "pypi", "-", bad, "1").is_err(),
                 "accepted {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn go_module_paths_survive() {
+        // Upstream addresses a Go module as one segment with its slashes
+        // encoded -- go/golang/github.com%2fpkg/errors/v0.9.1 -- and axum hands
+        // it to us already decoded. Refusing the slash made every Go coordinate
+        // unaddressable; refusing a leftover `%` does not, because by this
+        // point a legitimate coordinate has none.
+        let coord = Coordinate::parse("go", "golang", "github.com/pkg", "errors", "v0.9.1")
+            .expect("rejected a real Go coordinate");
+
+        // Re-encoded on the way out, so the upstream path is the one upstream
+        // expects and the cache key is stable.
+        assert_eq!(
+            coord.cache_key(),
+            "go/golang/github.com%2fpkg/errors/v0.9.1"
+        );
+
+        assert!(Coordinate::parse("go", "golang", "gopkg.in/yaml.v3", "yaml.v3", "v3.0.1").is_ok());
     }
 
     #[test]
