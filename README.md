@@ -140,6 +140,7 @@ power cut costs a re-fetch, which is what a cache is for.
 | `UPSTREAM_ATTEMPTS` | `3` | Total attempts per fetch |
 | `UPSTREAM_TIMEOUT_SECS` | `8` | Per-attempt timeout |
 | `UPSTREAM_DEADLINE_SECS` | `25` | Ceiling across all attempts |
+| `CLIENT_DEADLINE_SECS` | `5` | How long a *request* waits. The resolve behind it keeps running and still populates the cache, so a caller that gives up loses latency rather than the answer |
 
 If `CACHE_PATH` cannot be opened the service logs it and runs memory-only rather
 than refusing to start — a missing volume should not be an outage.

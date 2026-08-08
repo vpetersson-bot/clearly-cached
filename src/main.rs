@@ -66,6 +66,10 @@ struct Stats {
     disk_hits: AtomicU64,
     misses: AtomicU64,
     upstream_errors: AtomicU64,
+    /// Requests answered "not yet" because the resolve outlived the client
+    /// deadline. The resolve itself keeps running, so these are the ones a
+    /// retry is expected to hit warm.
+    slow_resolves: AtomicU64,
 }
 
 /// Where an answer came from. Reported as `x-cache` so a CDN or an operator can
@@ -107,6 +111,9 @@ struct AppState {
     cache: Cache<Definition>,
     client: Client,
     stats: Stats,
+    /// How long a *request* waits, as opposed to how long the resolve behind
+    /// it may run. See the wait in `definition`.
+    client_deadline: Duration,
     /// Coordinates currently being fetched, and how to hear the answer.
     ///
     /// The fetch runs in a spawned task rather than inline in the request that
@@ -155,6 +162,18 @@ async fn main() {
     // helped by an answer arriving later.
     let timeout = Duration::from_secs(env_u64("UPSTREAM_TIMEOUT_SECS", 8));
     let deadline = Duration::from_secs(env_u64("UPSTREAM_DEADLINE_SECS", 25));
+    // How long a request waits, which is a different question from how long
+    // the resolve may take. Because the resolve runs in its own task and
+    // publishes to the cache regardless, a caller that stops waiting loses
+    // nothing but latency: the answer lands anyway and the next request for
+    // that coordinate is a hit.
+    //
+    // Measured from the client side, a cold lookup had a p50 of 0.56s and a
+    // p90 of 20.7s -- the tail being coordinates upstream is slow to produce.
+    // The client treats a 504 as transient and moves on, so making it wait
+    // twenty more seconds for the same outcome buys nothing. Five seconds is
+    // well past the warm case and well short of the deadline.
+    let client_deadline = Duration::from_secs(env_u64("CLIENT_DEADLINE_SECS", 5));
 
     let http = reqwest::Client::builder()
         .timeout(timeout)
@@ -199,6 +218,7 @@ async fn main() {
     let state = Arc::new(AppState {
         cache: Cache::new(capacity),
         client: Client::new(http, upstream.clone(), attempts, deadline),
+        client_deadline,
         stats: Stats::default(),
         inflight: std::sync::Mutex::new(HashMap::new()),
         store,
@@ -297,6 +317,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "disk_hits": state.stats.disk_hits.load(Ordering::Relaxed),
         "misses": state.stats.misses.load(Ordering::Relaxed),
         "upstream_errors": state.stats.upstream_errors.load(Ordering::Relaxed),
+        "slow_resolves": state.stats.slow_resolves.load(Ordering::Relaxed),
     }))
 }
 
@@ -347,7 +368,26 @@ async fn definition(
         }
     };
 
-    match receiver.recv().await {
+    // Bounded separately from the resolve. The resolve is a detached task
+    // that publishes to the cache whatever this request does, so giving up on
+    // the wait costs the caller latency and nothing else -- and the retry it
+    // is expected to make lands on a warm entry. Waiting the full upstream
+    // deadline instead meant a client blocked for twenty-five seconds to be
+    // told the same "try again" it could have had in five.
+    //
+    // The in-flight entry is deliberately left in place: a retry arriving
+    // before the resolve finishes subscribes to the same one rather than
+    // starting a second fetch for a coordinate upstream is already slow at.
+    let waited = tokio::time::timeout(state.client_deadline, receiver.recv()).await;
+    let Ok(received) = waited else {
+        state.stats.slow_resolves.fetch_add(1, Ordering::Relaxed);
+        return error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "still resolving upstream; the fetch continues and a retry should be served from cache",
+        );
+    };
+
+    match received {
         Ok(shared) => match &*shared {
             Ok((def, ttl, source)) => serve(def.clone(), *ttl, *source),
             Err(failure) => error(failure.status, &failure.message),
@@ -565,10 +605,22 @@ mod tests {
         disk: Option<PathBuf>,
         deadline: Duration,
     ) -> Arc<AppState> {
+        // Long enough not to fire; the tests that care set it explicitly.
+        state_with_deadlines(upstream, capacity, disk, deadline, Duration::from_secs(30))
+    }
+
+    fn state_with_deadlines(
+        upstream: String,
+        capacity: usize,
+        disk: Option<PathBuf>,
+        deadline: Duration,
+        client_deadline: Duration,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             cache: Cache::new(capacity),
             client: Client::new(reqwest::Client::new(), upstream, 3, deadline),
             stats: Stats::default(),
+            client_deadline,
             inflight: std::sync::Mutex::new(HashMap::new()),
             store: disk.map(|p| Store::open(&p, 0).unwrap()),
         })
@@ -659,6 +711,76 @@ mod tests {
             2,
             "the evicted coordinate went back upstream"
         );
+    }
+
+    /// A caller should not wait out the upstream deadline to be told "later".
+    ///
+    /// The resolve is a detached task that publishes to the cache whatever the
+    /// request does, so giving up on the wait costs latency and nothing else.
+    /// Measured from the client side before this, a cold lookup had a p50 of
+    /// 0.56s and a p90 of 20.7s; the client treats the 504 as transient either
+    /// way, so the extra twenty seconds bought nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_resolve_answers_the_client_before_the_upstream_deadline() {
+        let hits = Arc::new(AtomicU64::new(0));
+        // Upstream far slower than the client is willing to wait.
+        let upstream = stub_upstream(hits.clone(), Duration::from_secs(3), StatusCode::OK).await;
+        let state = state_with_deadlines(
+            upstream,
+            16,
+            None,
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+        );
+        let base = serve_app(state.clone()).await;
+
+        let started = std::time::Instant::now();
+        let response = reqwest::get(format!("{base}/npm/npmjs/-/lodash/4.17.21"))
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            waited < Duration::from_secs(2),
+            "client waited {waited:?}, which is the upstream's problem rather than its own"
+        );
+        assert_eq!(state.stats.slow_resolves.load(Ordering::Relaxed), 1);
+
+        // The point of not cancelling: the fetch finishes anyway, so the retry
+        // a client is expected to make is served warm.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let retry = reqwest::get(format!("{base}/npm/npmjs/-/lodash/4.17.21"))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "the abandoned wait must not have caused a second upstream fetch"
+        );
+    }
+
+    /// The common case must not pay for the uncommon one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_resolve_is_served_normally() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits.clone(), Duration::from_millis(10), StatusCode::OK).await;
+        let state = state_with_deadlines(
+            upstream,
+            16,
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        );
+        let base = serve_app(state.clone()).await;
+
+        let response = reqwest::get(format!("{base}/npm/npmjs/-/lodash/4.17.21"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.stats.slow_resolves.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
