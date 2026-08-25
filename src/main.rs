@@ -702,7 +702,8 @@ mod tests {
         let hits = Arc::new(AtomicU64::new(0));
         let upstream = stub_upstream(hits.clone(), Duration::ZERO, StatusCode::OK).await;
         // Capacity of one, so the second coordinate evicts the first.
-        let base = serve_app(state_for(upstream, 1, Some(temp_db()))).await;
+        let state = state_for(upstream, 1, Some(temp_db()));
+        let base = serve_app(state.clone()).await;
         let client = reqwest::Client::new();
 
         let cache_header = |r: &reqwest::Response| {
@@ -719,6 +720,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache_header(&first), "MISS");
+
+        // Writes are batched onto a background thread, so `put` returns before
+        // the row exists and a response saying MISS does not mean the disk
+        // tier has it yet. What this test asserts is that an eviction is served
+        // from disk rather than upstream, which is only a question once the
+        // write has landed -- reading before then measures the queue, not the
+        // tier, and turns a slow commit into a failure about caching.
+        let key = Coordinate::parse("npm", "npmjs", "-", "lodash", "4.17.21")
+            .unwrap()
+            .cache_key();
+        let store = state
+            .store
+            .as_ref()
+            .expect("the test asked for a disk tier");
+        for _ in 0..500 {
+            if store.get(&key).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.get(&key).is_some(),
+            "the queued disk write never landed, so the eviction below cannot be served from disk"
+        );
 
         let second = client
             .get(format!("{base}/pypi/pypi/-/requests/2.32.3"))
