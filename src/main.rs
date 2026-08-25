@@ -175,6 +175,21 @@ async fn main() {
     // well past the warm case and well short of the deadline.
     let client_deadline = Duration::from_secs(env_u64("CLIENT_DEADLINE_SECS", 5));
 
+    // A client deadline at or above the upstream one is the same as having
+    // none: the resolve always answers first, so every caller waits out the
+    // full upstream deadline to be told what it could have been told in five
+    // seconds. That is a deployment mistake rather than a reason to refuse to
+    // start, so say so and carry on -- but say so, because from the outside it
+    // is indistinguishable from the bound not existing at all.
+    if client_deadline >= deadline {
+        eprintln!(
+            "config: CLIENT_DEADLINE_SECS ({}s) is not below UPSTREAM_DEADLINE_SECS ({}s), \
+             so callers will wait out the resolve instead of being told to retry",
+            client_deadline.as_secs(),
+            deadline.as_secs()
+        );
+    }
+
     let http = reqwest::Client::builder()
         .timeout(timeout)
         // Upstream stalls rather than refusing, so a connect timeout well below
@@ -229,7 +244,10 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
-    eprintln!("clearly-cached listening on {addr}, upstream {upstream}");
+    eprintln!(
+        "clearly-cached {} listening on {addr}, upstream {upstream}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     if state.store.is_some() {
         let state = state.clone();
@@ -309,8 +327,17 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Counters, and the build they were counted by.
+///
+/// The version is here because it was the missing fact in a real diagnosis: a
+/// deployment reported callers blocking for the full upstream deadline, which
+/// the source on the default branch bounds and has a test for. The deployment
+/// was a release behind, and nothing it served said so -- the counters, the
+/// headers and the error bodies are identical across the two builds. An
+/// operator has to be able to ask a running process what it is.
 async fn stats(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "entries": state.cache.len(),
         "disk_entries": state.store.as_ref().map(|s| s.len()),
         "hits": state.stats.hits.load(Ordering::Relaxed),
@@ -759,6 +786,29 @@ mod tests {
             1,
             "the abandoned wait must not have caused a second upstream fetch"
         );
+    }
+
+    /// An operator must be able to ask a running process which build it is.
+    ///
+    /// Without this, "the deployment behaves like the old code" and "the
+    /// deployment is the old code" cannot be told apart from outside, which is
+    /// exactly how a caller-deadline fix sat unreleased while the symptom it
+    /// fixed was reported against the branch that already had it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stats_reports_the_running_version() {
+        let hits = Arc::new(AtomicU64::new(0));
+        let upstream = stub_upstream(hits, Duration::ZERO, StatusCode::OK).await;
+        let base = serve_app(state_for(upstream, 16, None)).await;
+        let root = base.trim_end_matches("/v1/definitions");
+
+        let body: serde_json::Value = reqwest::get(format!("{root}/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     }
 
     /// The common case must not pay for the uncommon one.
